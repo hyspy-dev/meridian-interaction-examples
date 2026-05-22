@@ -1,0 +1,12 @@
+{
+  "name": "Meridian Interaction Test",
+  "version": "1.0.0",
+  "main": "meridian.interactiontest.InteractionTestModule",
+  "priority": 100,
+  "dependsOn": {
+    "meridian-core": ">=0.3.0"
+  },
+  "requires": {
+    "services": ["meridian.core.api.InteractionControl"]
+  }
+}
