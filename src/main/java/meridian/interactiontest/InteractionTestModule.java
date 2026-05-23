@@ -19,17 +19,31 @@ import meridian.core.api.World;
 import org.slf4j.Logger;
 
 /**
- * meridian-interaction-test — a Layer-2 test module.
+ * meridian-interaction-test — a Layer-2 demo / sandbox module for
+ * meridian-core's interaction system. Pure Layer-2, no {@code meridian.protocol}.
  *
- * <p>A demonstration of meridian-core's building blocks: it queries the
- * {@link World} and acts on {@link Block}s, writing its own scan / decision
- * logic. Core supplies the objects and removes the packet plumbing — the
- * behaviour ("scan a radius, use matching blocks") lives here, in the module.
+ * <p>Two workflows, both driven from a {@link SettingsSpec}-rendered panel:
  *
- * <p>The whole panel is declared with {@link SettingsSpec}: text fields for
- * coordinates and scan parameters, buttons for each action. X/Y/Z are
- * two-way bound — the "Fill from last observed block" button and the
- * {@link SelectionBus} listener push values into the fields directly.
+ * <ul>
+ *   <li><b>Single block</b> — type X/Y/Z (or fill them from the last observed
+ *       block, or from another module via {@link SelectionBus}), then hit one
+ *       of the action buttons: <i>Use, Hit, Plant, Water</i>. The resolved
+ *       {@link Block} runs through {@link InteractionControl}'s forge queue.</li>
+ *   <li><b>Scan radius</b> — pick a cube around the player and a name filter,
+ *       then <i>Use / Break / Water / Plant nearby</i>. The module scans the
+ *       cube via {@link World}, filters by block-type name, and pipes each
+ *       match into the forge queue. "Break nearby" auto-re-hits until each
+ *       block reports as air (single hit isn't always enough).</li>
+ * </ul>
+ *
+ * <p>X/Y/Z are bound through {@link SettingBinding}s — both the "Fill from
+ * last observed block" button and the cross-module {@link SelectionBus}
+ * listener mutate the rendered fields directly. Scan parameters (radius,
+ * name filter) are persisted; the X/Y/Z target itself is session-only.
+ *
+ * <p>This is the canonical worked example for actuators that need cross-module
+ * input — see also {@code meridian-esp}'s "Nearest blocks" list, which
+ * publishes through the same {@link SelectionBus}.
  */
 public class InteractionTestModule implements ProxyModule {
 
