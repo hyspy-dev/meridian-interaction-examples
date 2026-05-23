@@ -3,6 +3,7 @@
   "version": "1.0.0",
   "main": "meridian.interactiontest.InteractionTestModule",
   "priority": 100,
+  "updateUrl": "https://github.com/hyspy-dev/meridian-interaction-test/releases",
   "dependsOn": {
     "meridian-core": ">=0.3.0"
   },

@@ -1,26 +1,19 @@
 package meridian.interactiontest;
 
-import java.awt.Color;
-import java.awt.Component;
-import java.awt.Dimension;
-import java.awt.FlowLayout;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
 import java.util.function.Consumer;
-import javax.swing.BorderFactory;
-import javax.swing.Box;
-import javax.swing.BoxLayout;
-import javax.swing.JButton;
-import javax.swing.JLabel;
-import javax.swing.JPanel;
-import javax.swing.JTextField;
+import javax.swing.SwingUtilities;
 import meridian.api.module.ModuleContext;
 import meridian.api.module.ProxyModule;
+import meridian.api.settings.SettingBinding;
+import meridian.api.settings.SettingsSpec;
 import meridian.core.api.Block;
 import meridian.core.api.BlockPos;
 import meridian.core.api.InteractionControl;
 import meridian.core.api.Player;
+import meridian.core.api.SelectionBus;
 import meridian.core.api.Vec3;
 import meridian.core.api.World;
 import org.slf4j.Logger;
@@ -32,116 +25,143 @@ import org.slf4j.Logger;
  * {@link World} and acts on {@link Block}s, writing its own scan / decision
  * logic. Core supplies the objects and removes the packet plumbing — the
  * behaviour ("scan a radius, use matching blocks") lives here, in the module.
+ *
+ * <p>The whole panel is declared with {@link SettingsSpec}: text fields for
+ * coordinates and scan parameters, buttons for each action. X/Y/Z are
+ * two-way bound — the "Fill from last observed block" button and the
+ * {@link SelectionBus} listener push values into the fields directly.
  */
 public class InteractionTestModule implements ProxyModule {
 
-    private static final Color BG = new Color(20, 20, 20);
-    private static final Color FG = Color.WHITE;
-    private static final Color FIELD_BG = new Color(35, 35, 35);
-    private static final Color BUTTON_BG = new Color(55, 55, 60);
-
     /** Cap on re-hits per block in 'Break nearby' — stops an unbreakable block looping. */
     private static final int MAX_HITS_PER_BLOCK = 12;
+
+    // Live-mirrored from each text field's onChange.
+    private volatile String xText = "";
+    private volatile String yText = "";
+    private volatile String zText = "";
+    private volatile String matchText = "Flower";
+    private volatile int radius = 4;
+
+    // Two-way bindings for X/Y/Z — modules and the SelectionBus listener push
+    // values into the rendered fields through these.
+    private final SettingBinding<String> xBinding = new SettingBinding<>();
+    private final SettingBinding<String> yBinding = new SettingBinding<>();
+    private final SettingBinding<String> zBinding = new SettingBinding<>();
 
     @Override
     public void onEnable(ModuleContext ctx) {
         Logger log = ctx.getLogger();
         World world = ctx.services().require(World.class);
         InteractionControl interactions = ctx.services().require(InteractionControl.class);
-        ctx.registerSettings(buildPanel(world, interactions, log));
+        SelectionBus selectionBus = ctx.services().get(SelectionBus.class).orElse(null);
+
+        // X/Y/Z are a target the user picks for this session — pointless to
+        // restore a random triple from a previous run. The scan radius and
+        // name filter are tuning, persisted.
+        ctx.registerSettings(SettingsSpec.builder()
+                .section("Single block", SettingsSpec.builder()
+                        .string("x", "X", "", v -> xText = v == null ? "" : v, xBinding)
+                        .string("y", "Y", "", v -> yText = v == null ? "" : v, yBinding)
+                        .string("z", "Z", "", v -> zText = v == null ? "" : v, zBinding)
+                        .button("Fill from last observed block",
+                                () -> fillFromLastObserved(interactions, log))
+                        .button("Use on block", () -> runOnTarget(world, interactions, log, "Use on block", Block::use))
+                        .button("Hit block", () -> runOnTarget(world, interactions, log, "Hit block", Block::hit))
+                        .button("Plant on block", () -> runOnTarget(world, interactions, log, "Plant on block", Block::plant))
+                        .button("Water block", () -> runOnTarget(world, interactions, log, "Water block", Block::water))
+                        .build())
+                .section("Scan radius", SettingsSpec.builder()
+                        .int_("radius", "Radius", 1, 64, 4, v -> radius = v)
+                        .string("match", "Name (contains)", "Flower",
+                                v -> matchText = v == null ? "" : v)
+                        .button("Use nearby", () -> useNearby(world, log))
+                        .button("Break nearby", () -> breakNearby(world, log))
+                        .button("Water nearby", () -> waterNearby(world, log))
+                        .button("Plant nearby", () -> plantNearby(world, log))
+                        .build())
+                .persistent("radius", "match")
+                .build());
+
+        // Cross-module fill — any module (currently ESP's "Nearest blocks"
+        // click) can publish a block to SelectionBus and our X/Y/Z snap to it.
+        // Also pull the current selection in case it was set before we
+        // subscribed.
+        if (selectionBus != null) {
+            selectionBus.lastBlock().ifPresent(this::applyBlock);
+            selectionBus.onBlockSelected(p ->
+                    SwingUtilities.invokeLater(() -> applyBlock(p)));
+        }
+
         log.info("meridian-interaction-test enabled");
     }
 
-    @SuppressWarnings("deprecation") // a raw panel is the right tool for a test harness
-    private JPanel buildPanel(World world, InteractionControl interactions, Logger log) {
-        JPanel panel = column(BG);
-
-        // --- single block: X / Y / Z ----------------------------------------
-        JTextField x = field();
-        JTextField y = field();
-        JTextField z = field();
-        JPanel coords = row();
-        coords.add(label("X")); coords.add(x);
-        coords.add(label("Y")); coords.add(y);
-        coords.add(label("Z")); coords.add(z);
-        panel.add(coords);
-
-        JButton fill = button("Fill from last observed block");
-        fill.addActionListener(e -> {
-            Optional<BlockPos> t = interactions.targetedBlock();
-            if (t.isEmpty()) {
-                log.warn("interaction-test: no observed block yet — interact with one in-game");
-                return;
-            }
-            BlockPos p = t.get();
-            x.setText(Integer.toString(p.x()));
-            y.setText(Integer.toString(p.y()));
-            z.setText(Integer.toString(p.z()));
-        });
-        panel.add(fill);
-        panel.add(Box.createVerticalStrut(6));
-
-        panel.add(blockAction("Use on block", world, interactions, log, x, y, z, Block::use));
-        panel.add(Box.createVerticalStrut(4));
-        panel.add(blockAction("Hit block", world, interactions, log, x, y, z, Block::hit));
-        panel.add(Box.createVerticalStrut(4));
-        panel.add(blockAction("Plant on block", world, interactions, log, x, y, z, Block::plant));
-        panel.add(Box.createVerticalStrut(4));
-        panel.add(blockAction("Water block", world, interactions, log, x, y, z, Block::water));
-        panel.add(Box.createVerticalStrut(10));
-
-        // --- scan a radius and use matching blocks --------------------------
-        // This is module logic — core only hands out World / Block / Player.
-        JTextField radius = field();
-        radius.setText("4");
-        JTextField match = field();
-        match.setColumns(12);
-        match.setText("Flower");
-        JPanel scanRow = row();
-        scanRow.add(label("Radius")); scanRow.add(radius);
-        scanRow.add(label("Name")); scanRow.add(match);
-        panel.add(scanRow);
-
-        JButton scan = button("Use nearby (scan radius)");
-        scan.addActionListener(e -> useNearby(world, log, radius, match));
-        panel.add(scan);
-        panel.add(Box.createVerticalStrut(4));
-
-        JButton breakScan = button("Break nearby (scan radius)");
-        breakScan.addActionListener(e -> breakNearby(world, log, radius, match));
-        panel.add(breakScan);
-        panel.add(Box.createVerticalStrut(4));
-
-        JButton water = button("Water nearby (scan radius)");
-        water.addActionListener(e -> waterNearby(world, log, radius));
-        panel.add(water);
-        panel.add(Box.createVerticalStrut(4));
-
-        JButton plant = button("Plant nearby (scan radius)");
-        plant.addActionListener(e -> plantNearby(world, log, radius));
-        panel.add(plant);
-        return panel;
+    /**
+     * Pulls the last block the player interacted with into the X/Y/Z fields.
+     * Reads from {@link InteractionControl#targetedBlock} — that observer is
+     * fed by core's interaction-chain observer, so the most recent in-game
+     * interaction wins.
+     */
+    private void fillFromLastObserved(InteractionControl interactions, Logger log) {
+        Optional<BlockPos> t = interactions.targetedBlock();
+        if (t.isEmpty()) {
+            log.warn("interaction-test: no observed block yet — interact with one in-game");
+            return;
+        }
+        applyBlock(t.get());
     }
+
+    /** Writes {@code p} into the X/Y/Z bound text fields. EDT-only. */
+    private void applyBlock(BlockPos p) {
+        xBinding.set(Integer.toString(p.x()));
+        yBinding.set(Integer.toString(p.y()));
+        zBinding.set(Integer.toString(p.z()));
+    }
+
+    /** Parses the X/Y/Z text fields and runs {@code action} on the resolved block. */
+    private void runOnTarget(World world, InteractionControl interactions, Logger log,
+                             String label, Consumer<Block> action) {
+        if (!interactions.available()) {
+            log.warn("interaction-test: no session — join a world first");
+            return;
+        }
+        Optional<BlockPos> pos = parseXyz(log);
+        if (pos.isEmpty()) {
+            return;
+        }
+        BlockPos p = pos.get();
+        log.info("interaction-test: '{}' at ({},{},{})", label, p.x(), p.y(), p.z());
+        action.accept(world.blockAt(p.x(), p.y(), p.z()));
+    }
+
+    private Optional<BlockPos> parseXyz(Logger log) {
+        try {
+            return Optional.of(new BlockPos(
+                    Integer.parseInt(xText.trim()),
+                    Integer.parseInt(yText.trim()),
+                    Integer.parseInt(zText.trim())));
+        } catch (NumberFormatException ex) {
+            log.warn("interaction-test: enter integer X / Y / Z coordinates first");
+            return Optional.empty();
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // 'Nearby' scan actions — module logic, core only hands out World / Block / Player.
+    // ------------------------------------------------------------------
 
     /**
      * Module-side logic: switch to the seed item, plant on every empty tilled-soil
      * block in range, switch back. As with watering, the module just issues the
      * calls — core's forge queue serializes the chains.
      */
-    private static void plantNearby(World world, Logger log, JTextField radiusField) {
+    private void plantNearby(World world, Logger log) {
         Optional<Player> maybePlayer = world.player();
         if (maybePlayer.isEmpty()) {
             log.warn("interaction-test: no session — join a world first");
             return;
         }
         Player player = maybePlayer.get();
-        int radius;
-        try {
-            radius = Integer.parseInt(radiusField.getText().trim());
-        } catch (NumberFormatException ex) {
-            log.warn("interaction-test: enter an integer radius first");
-            return;
-        }
         int seedSlot = player.hotbarSlotOf("Seed");
         if (seedSlot < 0) {
             log.warn("interaction-test: no seed item in the hotbar");
@@ -152,14 +172,15 @@ public class InteractionTestModule implements ProxyModule {
             log.warn("interaction-test: player position unknown");
             return;
         }
+        int r = radius;
         int px = (int) Math.floor(pos.x());
         int py = (int) Math.floor(pos.y());
         int pz = (int) Math.floor(pos.z());
 
         // Tilled soil with air directly above — room for the crop block.
         List<Block> soil = new ArrayList<>();
-        for (int dx = -radius; dx <= radius; dx++) {
-            for (int dz = -radius; dz <= radius; dz++) {
+        for (int dx = -r; dx <= r; dx++) {
+            for (int dz = -r; dz <= r; dz++) {
                 for (int dy = -2; dy <= 1; dy++) {
                     Block b = world.blockAt(px + dx, py + dy, pz + dz);
                     if (b.type() != null && b.type().name() != null
@@ -171,13 +192,12 @@ public class InteractionTestModule implements ProxyModule {
             }
         }
         if (soil.isEmpty()) {
-            log.info("interaction-test: 'Plant nearby' — no empty tilled soil within {}", radius);
+            log.info("interaction-test: 'Plant nearby' — no empty tilled soil within {}", r);
             return;
         }
 
         int original = player.activeHotbarSlot();
-        log.info("interaction-test: 'Plant nearby' radius {} — {} soil block(s)",
-                radius, soil.size());
+        log.info("interaction-test: 'Plant nearby' radius {} — {} soil block(s)", r, soil.size());
         player.selectHotbarSlot(seedSlot);
         for (Block b : soil) {
             b.plant();
@@ -193,20 +213,13 @@ public class InteractionTestModule implements ProxyModule {
      * core's forge queue runs each chain to completion before the next, so no
      * hand-spacing is needed even though a watering charge spans many ticks.
      */
-    private static void waterNearby(World world, Logger log, JTextField radiusField) {
+    private void waterNearby(World world, Logger log) {
         Optional<Player> maybePlayer = world.player();
         if (maybePlayer.isEmpty()) {
             log.warn("interaction-test: no session — join a world first");
             return;
         }
         Player player = maybePlayer.get();
-        int radius;
-        try {
-            radius = Integer.parseInt(radiusField.getText().trim());
-        } catch (NumberFormatException ex) {
-            log.warn("interaction-test: enter an integer radius first");
-            return;
-        }
         int canSlot = player.hotbarSlotOf("Watering_Can");
         if (canSlot < 0) {
             log.warn("interaction-test: no watering can in the hotbar");
@@ -217,13 +230,14 @@ public class InteractionTestModule implements ProxyModule {
             log.warn("interaction-test: player position unknown");
             return;
         }
+        int r = radius;
         int px = (int) Math.floor(pos.x());
         int py = (int) Math.floor(pos.y());
         int pz = (int) Math.floor(pos.z());
 
         List<Block> soil = new ArrayList<>();
-        for (int dx = -radius; dx <= radius; dx++) {
-            for (int dz = -radius; dz <= radius; dz++) {
+        for (int dx = -r; dx <= r; dx++) {
+            for (int dz = -r; dz <= r; dz++) {
                 for (int dy = -2; dy <= 1; dy++) {
                     Block b = world.blockAt(px + dx, py + dy, pz + dz);
                     if (b.type() != null && b.type().name() != null
@@ -234,13 +248,12 @@ public class InteractionTestModule implements ProxyModule {
             }
         }
         if (soil.isEmpty()) {
-            log.info("interaction-test: 'Water nearby' — no tilled soil within {}", radius);
+            log.info("interaction-test: 'Water nearby' — no tilled soil within {}", r);
             return;
         }
 
         int original = player.activeHotbarSlot();
-        log.info("interaction-test: 'Water nearby' radius {} — {} soil block(s)",
-                radius, soil.size());
+        log.info("interaction-test: 'Water nearby' radius {} — {} soil block(s)", r, soil.size());
         // Each call is async — it returns a future and core's queue runs the
         // chains in order. We only need the future of the last one: it completes
         // after everything ahead of it on the queue, so .thenRun fires when the
@@ -255,33 +268,26 @@ public class InteractionTestModule implements ProxyModule {
     }
 
     /** Module-side logic: scan a radius around the player, use blocks by name. */
-    private static void useNearby(World world, Logger log, JTextField radiusField,
-                                  JTextField matchField) {
+    private void useNearby(World world, Logger log) {
         Optional<Player> maybePlayer = world.player();
         if (maybePlayer.isEmpty()) {
             log.warn("interaction-test: no session — join a world first");
             return;
         }
-        int radius;
-        try {
-            radius = Integer.parseInt(radiusField.getText().trim());
-        } catch (NumberFormatException ex) {
-            log.warn("interaction-test: enter an integer radius first");
-            return;
-        }
-        String name = matchField.getText().trim();
+        String name = matchText.trim();
         Vec3 pos = maybePlayer.get().position();
         if (pos == null) {
             log.warn("interaction-test: player position unknown");
             return;
         }
+        int r = radius;
         int px = (int) Math.floor(pos.x());
         int py = (int) Math.floor(pos.y());
         int pz = (int) Math.floor(pos.z());
 
         int used = 0;
-        for (int dx = -radius; dx <= radius; dx++) {
-            for (int dz = -radius; dz <= radius; dz++) {
+        for (int dx = -r; dx <= r; dx++) {
+            for (int dz = -r; dz <= r; dz++) {
                 for (int dy = -2; dy <= 2; dy++) {
                     Block block = world.blockAt(px + dx, py + dy, pz + dz);
                     if (block.type() != null && block.type().name() != null
@@ -293,7 +299,7 @@ public class InteractionTestModule implements ProxyModule {
             }
         }
         log.info("interaction-test: 'Use nearby' radius {} name '{}' — used {} block(s)",
-                radius, name, used);
+                r, name, used);
     }
 
     /**
@@ -302,34 +308,27 @@ public class InteractionTestModule implements ProxyModule {
      * all). One hit may not break a block, so each target is re-hit until the
      * world shows it as air ({@link #hitUntilGone}).
      */
-    private static void breakNearby(World world, Logger log, JTextField radiusField,
-                                    JTextField matchField) {
+    private void breakNearby(World world, Logger log) {
         Optional<Player> maybePlayer = world.player();
         if (maybePlayer.isEmpty()) {
             log.warn("interaction-test: no session — join a world first");
             return;
         }
-        int radius;
-        try {
-            radius = Integer.parseInt(radiusField.getText().trim());
-        } catch (NumberFormatException ex) {
-            log.warn("interaction-test: enter an integer radius first");
-            return;
-        }
-        String name = matchField.getText().trim();
+        String name = matchText.trim();
         Vec3 pos = maybePlayer.get().position();
         if (pos == null) {
             log.warn("interaction-test: player position unknown");
             return;
         }
+        int r = radius;
         int px = (int) Math.floor(pos.x());
         int py = (int) Math.floor(pos.y());
         int pz = (int) Math.floor(pos.z());
 
         List<BlockPos> targets = new ArrayList<>();
-        for (int dx = -radius; dx <= radius; dx++) {
-            for (int dz = -radius; dz <= radius; dz++) {
-                for (int dy = -radius; dy <= radius; dy++) {
+        for (int dx = -r; dx <= r; dx++) {
+            for (int dz = -r; dz <= r; dz++) {
+                for (int dy = -r; dy <= r; dy++) {
                     Block block = world.blockAt(px + dx, py + dy, pz + dz);
                     if (block.isAir() || block.type() == null || block.type().name() == null) {
                         continue;
@@ -341,7 +340,7 @@ public class InteractionTestModule implements ProxyModule {
             }
         }
         log.info("interaction-test: 'Break nearby' radius {} name '{}' — {} target(s), "
-                + "hitting until clear", radius, name, targets.size());
+                + "hitting until clear", r, name, targets.size());
         for (BlockPos target : targets) {
             hitUntilGone(world, log, target, 0);
         }
@@ -364,86 +363,5 @@ public class InteractionTestModule implements ProxyModule {
             return;
         }
         block.hit().thenRun(() -> hitUntilGone(world, log, pos, attempt + 1));
-    }
-
-    /** A button that resolves the X/Y/Z block from the world and runs {@code action}. */
-    private JButton blockAction(String label, World world, InteractionControl interactions,
-                                Logger log, JTextField x, JTextField y, JTextField z,
-                                Consumer<Block> action) {
-        JButton b = button(label);
-        b.addActionListener(e -> {
-            if (!interactions.available()) {
-                log.warn("interaction-test: no session — join a world first");
-                return;
-            }
-            Optional<BlockPos> pos = parse(x, y, z, log);
-            if (pos.isEmpty()) {
-                return;
-            }
-            BlockPos p = pos.get();
-            log.info("interaction-test: '{}' at ({},{},{})", label, p.x(), p.y(), p.z());
-            action.accept(world.blockAt(p.x(), p.y(), p.z()));
-        });
-        return b;
-    }
-
-    private static Optional<BlockPos> parse(JTextField x, JTextField y, JTextField z, Logger log) {
-        try {
-            return Optional.of(new BlockPos(
-                    Integer.parseInt(x.getText().trim()),
-                    Integer.parseInt(y.getText().trim()),
-                    Integer.parseInt(z.getText().trim())));
-        } catch (NumberFormatException ex) {
-            log.warn("interaction-test: enter integer X / Y / Z coordinates first");
-            return Optional.empty();
-        }
-    }
-
-    // ------------------------------------------------------------------
-    // Swing helpers
-    // ------------------------------------------------------------------
-
-    private static JPanel column(Color bg) {
-        JPanel p = new JPanel();
-        p.setLayout(new BoxLayout(p, BoxLayout.Y_AXIS));
-        p.setBackground(bg);
-        return p;
-    }
-
-    private static JPanel row() {
-        JPanel p = new JPanel(new FlowLayout(FlowLayout.LEFT, 4, 2));
-        p.setBackground(BG);
-        p.setAlignmentX(Component.LEFT_ALIGNMENT);
-        return p;
-    }
-
-    private static JLabel label(String text) {
-        JLabel l = new JLabel(text);
-        l.setForeground(FG);
-        return l;
-    }
-
-    private static JTextField field() {
-        JTextField f = new JTextField(4);
-        f.setBackground(FIELD_BG);
-        f.setForeground(FG);
-        f.setCaretColor(FG);
-        return f;
-    }
-
-    private static JButton button(String label) {
-        JButton b = new JButton(label);
-        // Swing look-and-feels ignore setBackground on the default button paint;
-        // disabling the LAF content fill and painting our own keeps the dark
-        // background (and the white text legible) on every platform.
-        b.setContentAreaFilled(false);
-        b.setOpaque(true);
-        b.setBackground(BUTTON_BG);
-        b.setForeground(FG);
-        b.setFocusPainted(false);
-        b.setAlignmentX(Component.LEFT_ALIGNMENT);
-        b.setMaximumSize(new Dimension(Integer.MAX_VALUE, 28));
-        b.setBorder(BorderFactory.createLineBorder(new Color(90, 90, 95)));
-        return b;
     }
 }
