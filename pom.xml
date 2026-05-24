@@ -4,7 +4,7 @@
     <modelVersion>4.0.0</modelVersion>
 
     <groupId>meridian</groupId>
-    <artifactId>meridian-interaction-test</artifactId>
+    <artifactId>meridian-interaction-examples</artifactId>
     <version>1.0.0-SNAPSHOT</version>
 
     <!-- A Layer-2 test module: buttons that fire meridian-core's InteractionControl

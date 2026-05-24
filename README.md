@@ -1,4 +1,4 @@
-# Meridian Interaction Test
+# Meridian Interaction Examples
 
 A demo / sandbox panel for [Meridian Proxy](../meridian-proxy)'s
 interaction-chain forging — a pure Layer-2 module built on top of
@@ -19,7 +19,7 @@ subscribes to `SelectionBus` for cross-module fill of the X/Y/Z fields. Put
 ```
 modules/
 ├── meridian-core-impl-*.jar
-└── meridian-interaction-test-*.jar
+└── meridian-interaction-examples-*.jar
 ```
 
 `meridian-core` loads first (the module's `module.json` declares
@@ -95,7 +95,7 @@ Needs `meridian-api` and `meridian-core-api` in the local Maven repo — build t
 repos first (`mvn install`). Produces the loadable module:
 
 ```
-target/meridian-interaction-test-<version>.jar
+target/meridian-interaction-examples-<version>.jar
 ```
 
 Or build every Meridian module at once with the repo-root `build-releases.ps1`,
@@ -114,7 +114,7 @@ The split:
 - **`meridian-core`** (Layer-1) owns the whole forge machinery — `World`,
   `Block`, `InteractionControl`, the registries and trackers, plus the
   `SelectionBus` pub/sub. All `meridian-protocol` contact lives here.
-- **`meridian-interaction-test`** (Layer-2) is a thin
+- **`meridian-interaction-examples`** (Layer-2) is a thin
   [`SettingsSpec`](../meridian-proxy/docs/settings.md)-rendered panel: text
   fields, buttons, a scheduler-free body that delegates everything to the
   core API.

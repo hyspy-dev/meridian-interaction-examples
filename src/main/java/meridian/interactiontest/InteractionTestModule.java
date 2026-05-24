@@ -19,7 +19,7 @@ import meridian.core.api.World;
 import org.slf4j.Logger;
 
 /**
- * meridian-interaction-test — a Layer-2 demo / sandbox module for
+ * meridian-interaction-examples — a Layer-2 demo / sandbox module for
  * meridian-core's interaction system. Pure Layer-2, no {@code meridian.protocol}.
  *
  * <p>Two workflows, both driven from a {@link SettingsSpec}-rendered panel:
@@ -107,7 +107,7 @@ public class InteractionTestModule implements ProxyModule {
                     SwingUtilities.invokeLater(() -> applyBlock(p)));
         }
 
-        log.info("meridian-interaction-test enabled");
+        log.info("meridian-interaction-examples enabled");
     }
 
     /**
