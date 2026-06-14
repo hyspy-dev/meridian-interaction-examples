@@ -56,6 +56,7 @@ public class InteractionTestModule implements ProxyModule {
     private volatile String zText = "";
     private volatile String matchText = "Flower";
     private volatile int radius = 4;
+    private volatile int dropQty = 0;
 
     // Two-way bindings for X/Y/Z — modules and the SelectionBus listener push
     // values into the rendered fields through these.
@@ -94,7 +95,14 @@ public class InteractionTestModule implements ProxyModule {
                         .button("Water nearby", () -> waterNearby(world, log))
                         .button("Plant nearby", () -> plantNearby(world, log))
                         .build())
-                .persistent("radius", "match")
+                // Drops the held hotbar item via core's forge. quantity 0 is the
+                // pre-51 phantom-drop vector (patched in 0.6.0-pre.2).
+                .section("Inventory", SettingsSpec.builder()
+                        .int_("dropQty", "Drop quantity",
+                                -1, 64, 0, v -> dropQty = v)
+                        .button("Drop held", () -> dropHeld(world, log))
+                        .build())
+                .persistent("radius", "match", "dropQty")
                 .build());
 
         // Cross-module fill — any module (currently ESP's "Nearest blocks"
@@ -116,6 +124,22 @@ public class InteractionTestModule implements ProxyModule {
      * fed by core's interaction-chain observer, so the most recent in-game
      * interaction wins.
      */
+    /**
+     * Drops the held hotbar item through core's {@link Player#dropHeld} forge.
+     * {@code dropQty = 0} reproduces the pre-51 phantom drop for testing a
+     * vulnerable dev server (the slot stays, a count-0 item entity spawns).
+     */
+    private void dropHeld(World world, Logger log) {
+        Optional<Player> player = world.player();
+        if (player.isEmpty()) {
+            log.warn("interaction-test: no player yet — join a world first");
+            return;
+        }
+        Player p = player.get();
+        p.dropHeld(dropQty);
+        log.info("interaction-test: drop held (slot {}) qty={}", p.activeHotbarSlot(), dropQty);
+    }
+
     private void fillFromLastObserved(InteractionControl interactions, Logger log) {
         Optional<BlockPos> t = interactions.targetedBlock();
         if (t.isEmpty()) {
