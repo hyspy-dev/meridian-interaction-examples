@@ -1,8 +1,11 @@
 package meridian.interactiontest;
 
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Consumer;
 import javax.swing.SwingUtilities;
 import meridian.api.module.ModuleContext;
@@ -22,7 +25,7 @@ import org.slf4j.Logger;
  * meridian-interaction-examples — a Layer-2 demo / sandbox module for
  * meridian-core's interaction system. Pure Layer-2, no {@code meridian.protocol}.
  *
- * <p>Two workflows, both driven from a {@link SettingsSpec}-rendered panel:
+ * <p>Three workflows, all driven from a {@link SettingsSpec}-rendered panel:
  *
  * <ul>
  *   <li><b>Single block</b> — type X/Y/Z (or fill them from the last observed
@@ -34,6 +37,14 @@ import org.slf4j.Logger;
  *       cube via {@link World}, filters by block-type name, and pipes each
  *       match into the forge queue. "Break nearby" auto-re-hits until each
  *       block reports as air (single hit isn't always enough).</li>
+ *   <li><b>Lights</b> — <i>Turn off lights nearby</i> scans a cube, filters by
+ *       {@link meridian.core.api.BlockView#isLit()}, logs each block's
+ *       {@link meridian.core.api.BlockView#state()}, and forges a <i>Use</i> on
+ *       each — the worked example for the block-state projection. The <i>Auto
+ *       (every 0.25s)</i> checkbox runs that sweep on a 4&nbsp;Hz ticker, keeping
+ *       lamps in range off; a per-id guard ({@code litActuated}) actuates each lamp
+ *       once and only re-acts after its block id has actually changed, so a lamp is
+ *       turned off rather than toggled back and forth.</li>
  * </ul>
  *
  * <p>X/Y/Z are bound through {@link SettingBinding}s — both the "Fill from
@@ -50,13 +61,24 @@ public class InteractionTestModule implements ProxyModule {
     /** Cap on re-hits per block in 'Break nearby' — stops an unbreakable block looping. */
     private static final int MAX_HITS_PER_BLOCK = 12;
 
+    /** Auto-lights sweep cadence — the 0.25&nbsp;s tick requested for the area light-off. */
+    private static final Duration AUTO_LIGHTS_PERIOD = Duration.ofMillis(250);
+
     // Live-mirrored from each text field's onChange.
     private volatile String xText = "";
     private volatile String yText = "";
     private volatile String zText = "";
     private volatile String matchText = "Flower";
     private volatile int radius = 4;
+    private volatile int lightRadius = 6;
+    private volatile boolean autoLights = false;
     private volatile int dropQty = 0;
+
+    // Lamps already actuated: position -> the lit block id we forged a Use on. A
+    // sweep skips a lamp still reading that same id (its Use hasn't propagated yet),
+    // so a lamp is only ever turned off, never toggled back on. The entry clears once
+    // the block reads unlit, so a genuine re-light can be turned off again.
+    private final Map<BlockPos, Integer> litActuated = new ConcurrentHashMap<>();
 
     // Two-way bindings for X/Y/Z — modules and the SelectionBus listener push
     // values into the rendered fields through these.
@@ -95,6 +117,14 @@ public class InteractionTestModule implements ProxyModule {
                         .button("Water nearby", () -> waterNearby(world, log))
                         .button("Plant nearby", () -> plantNearby(world, log))
                         .build())
+                // ESP-style probe of the new BlockView.state() projection: find every
+                // light-emitting block in a cube and forge a Use on each (a lamp toggles
+                // off). Its own radius so it can reach ceiling/wall fixtures.
+                .section("Lights", SettingsSpec.builder()
+                        .int_("lightRadius", "Radius", 1, 64, 6, v -> lightRadius = v)
+                        .bool("autoLights", "Auto (every 0.25s)", false, v -> autoLights = v)
+                        .button("Turn off lights nearby", () -> toggleLightsNearby(world, log))
+                        .build())
                 // Drops the held hotbar item via core's forge. quantity 0 is the
                 // pre-51 phantom-drop vector (patched in 0.6.0-pre.2).
                 .section("Inventory", SettingsSpec.builder()
@@ -102,7 +132,7 @@ public class InteractionTestModule implements ProxyModule {
                                 -1, 64, 0, v -> dropQty = v)
                         .button("Drop held", () -> dropHeld(world, log))
                         .build())
-                .persistent("radius", "match", "dropQty")
+                .persistent("radius", "match", "lightRadius", "dropQty")
                 .build());
 
         // Cross-module fill — any module (currently ESP's "Nearest blocks"
@@ -114,6 +144,12 @@ public class InteractionTestModule implements ProxyModule {
             selectionBus.onBlockSelected(p ->
                     SwingUtilities.invokeLater(() -> applyBlock(p)));
         }
+
+        // Auto-lights ticker: always scheduled, gated on the checkbox flag (the
+        // EspModule pattern). The per-connection scheduler is torn down on
+        // disconnect, and onDisable clears the flag, so it stops cleanly.
+        ctx.scheduler().scheduleAtFixedRate(() -> autoLightsTick(world, log),
+                AUTO_LIGHTS_PERIOD, AUTO_LIGHTS_PERIOD);
 
         log.info("meridian-interaction-examples enabled");
     }
@@ -338,6 +374,107 @@ public class InteractionTestModule implements ProxyModule {
         }
         log.info("interaction-test: 'Use nearby' radius {} name '{}' — used {} block(s)",
                 r, name, used);
+    }
+
+    /**
+     * Manual one-shot: sweep the cube once and report. Verbose — logs each lit
+     * block's {@link meridian.core.api.BlockView#state()} so the new projection is
+     * visible — and warns when there's no session/position.
+     */
+    private void toggleLightsNearby(World world, Logger log) {
+        if (world.player().isEmpty()) {
+            log.warn("interaction-test: no session — join a world first");
+            return;
+        }
+        int used = sweepLights(world, log, true);
+        log.info("interaction-test: 'Turn off lights nearby' radius {} — used {} lit block(s)",
+                lightRadius, used);
+    }
+
+    /**
+     * Auto-lights ticker body (every {@link #AUTO_LIGHTS_PERIOD}). A no-op unless the
+     * checkbox is on; quiet otherwise — only logs when it actually actuates a lamp, so
+     * an idle ticker doesn't flood the console. Set false by {@link #onDisable} so the
+     * sweep stops the moment the connection tears down.
+     */
+    private void autoLightsTick(World world, Logger log) {
+        if (!autoLights) {
+            return;
+        }
+        int used = sweepLights(world, log, false);
+        if (used > 0) {
+            log.info("interaction-test: auto-lights — issued {} use(s) within {}", used, lightRadius);
+        }
+    }
+
+    /**
+     * The shared ESP-style sweep behind the button and the ticker: scan a cube around
+     * the player, collect every light-emitting block ({@link meridian.core.api.BlockView#isLit()}),
+     * and forge a {@code Use} on each — a toggleable lamp flips off.
+     *
+     * <p><b>Off, not toggle.</b> {@code Use} toggles a lamp, and the forge resolves
+     * before the resulting block change reaches the chunk tracker — so a naive sweep
+     * sees the lamp still lit and fires again, flipping it back on (flicker). The
+     * {@link #litActuated} guard keys on the <em>observed</em> block id: once a lit
+     * lamp is actuated, every later sweep that still reads that same id skips it, and
+     * only when the block reads unlit (its id changed) is the claim cleared. A lamp is
+     * therefore turned off exactly once and never toggled back on; a genuine re-light
+     * (the block goes unlit then lit again) is picked up afresh.
+     *
+     * <p>A lit block with no Use interaction (glowstone, lava) just no-ops the forge —
+     * still actuated once, then left alone. Returns how many uses were issued;
+     * {@code verbose} logs each lit block's {@link meridian.core.api.BlockView#state()}.
+     */
+    private int sweepLights(World world, Logger log, boolean verbose) {
+        Optional<Player> maybePlayer = world.player();
+        if (maybePlayer.isEmpty()) {
+            return 0;
+        }
+        Vec3 pos = maybePlayer.get().position();
+        if (pos == null) {
+            if (verbose) {
+                log.warn("interaction-test: player position unknown");
+            }
+            return 0;
+        }
+        int r = lightRadius;
+        int px = (int) Math.floor(pos.x());
+        int py = (int) Math.floor(pos.y());
+        int pz = (int) Math.floor(pos.z());
+
+        int used = 0;
+        for (int dx = -r; dx <= r; dx++) {
+            for (int dy = -r; dy <= r; dy++) {
+                for (int dz = -r; dz <= r; dz++) {
+                    Block block = world.blockAt(px + dx, py + dy, pz + dz);
+                    BlockPos at = new BlockPos(px + dx, py + dy, pz + dz);
+                    if (block.type() == null || !block.type().isLit()) {
+                        litActuated.remove(at); // off / air / unloaded — release the claim
+                        continue;
+                    }
+                    int id = block.type().id();
+                    Integer prev = litActuated.get(at);
+                    if (prev != null && prev == id) {
+                        continue; // already used this exact lit block; its change hasn't landed yet
+                    }
+                    litActuated.put(at, id);
+                    if (verbose) {
+                        log.info("interaction-test: light at ({},{},{}) '{}' state '{}'",
+                                at.x(), at.y(), at.z(), block.type().name(), block.type().state());
+                    }
+                    block.use();
+                    used++;
+                }
+            }
+        }
+        return used;
+    }
+
+    @Override
+    public void onDisable() {
+        // Stop the auto-sweep before the connection's World/forge are torn down.
+        autoLights = false;
+        litActuated.clear();
     }
 
     /**
