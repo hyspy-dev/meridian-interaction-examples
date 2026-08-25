@@ -1,6 +1,6 @@
 {
   "name": "Meridian Interaction Test",
-  "version": "1.0.0",
+  "version": "${project.version}",
   "main": "meridian.interactiontest.InteractionTestModule",
   "priority": 100,
   "updateUrl": "https://github.com/hyspy-dev/meridian-interaction-examples/releases",
