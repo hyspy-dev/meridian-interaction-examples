@@ -5,8 +5,11 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.OptionalInt;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.function.Consumer;
+import java.util.function.Function;
+import java.util.function.Supplier;
 import javax.swing.SwingUtilities;
 import meridian.api.module.ModuleContext;
 import meridian.api.module.ProxyModule;
@@ -14,7 +17,9 @@ import meridian.api.settings.SettingBinding;
 import meridian.api.settings.SettingsSpec;
 import meridian.core.api.Block;
 import meridian.core.api.BlockPos;
+import meridian.core.api.EntityTracker;
 import meridian.core.api.InteractionControl;
+import meridian.core.api.InteractionOutcome;
 import meridian.core.api.Player;
 import meridian.core.api.SelectionBus;
 import meridian.core.api.Vec3;
@@ -37,6 +42,11 @@ import org.slf4j.Logger;
  *       cube via {@link World}, filters by block-type name, and pipes each
  *       match into the forge queue. "Break nearby" auto-re-hits until each
  *       block reports as air (single hit isn't always enough).</li>
+ *   <li><b>Forge</b> — one click acts on what the crosshair is on: the block (hit, use,
+ *       right-click, place, dig swing), the entity (attack, use), or the air (use the held
+ *       item, swing). Each logs how the server ran the chain ({@link InteractionOutcome}):
+ *       its status, the operations that failed, its forks, the corrections. The way to check
+ *       core's forging by hand in a live game.</li>
  *   <li><b>Lights</b> — <i>Turn off lights nearby</i> scans a cube, filters by
  *       {@link meridian.core.api.BlockView#isLit()}, logs each block's
  *       {@link meridian.core.api.BlockView#state()}, and forges a <i>Use</i> on
@@ -92,6 +102,7 @@ public class InteractionTestModule implements ProxyModule {
         World world = ctx.services().require(World.class);
         InteractionControl interactions = ctx.services().require(InteractionControl.class);
         SelectionBus selectionBus = ctx.services().get(SelectionBus.class).orElse(null);
+        EntityTracker entities = ctx.services().get(EntityTracker.class).orElse(null);
 
         // X/Y/Z are a target the user picks for this session — pointless to
         // restore a random triple from a previous run. The scan radius and
@@ -107,6 +118,22 @@ public class InteractionTestModule implements ProxyModule {
                         .button("Hit block", () -> runOnTarget(world, interactions, log, "Hit block", Block::hit))
                         .button("Plant on block", () -> runOnTarget(world, interactions, log, "Plant on block", Block::plant))
                         .button("Water block", () -> runOnTarget(world, interactions, log, "Water block", Block::water))
+                        .build())
+                // One click on what the crosshair is on, with the server's verdict in the log.
+                .section("Forge", SettingsSpec.builder()
+                        .button("Hit block in crosshair", () -> onCrosshairBlock(world, log, "Hit", Block::hit))
+                        .button("Use block in crosshair", () -> onCrosshairBlock(world, log, "Use", Block::use))
+                        .button("Right-click block in crosshair (water, till, fill)",
+                                () -> onCrosshairBlock(world, log, "Right-click", Block::water))
+                        .button("Place on block in crosshair", () -> onCrosshairBlock(world, log, "Place", Block::place))
+                        .button("Dig swing at crosshair", () -> onCrosshairBlock(world, log, "Dig swing",
+                                b -> interactions.digSwing(new BlockPos(b.x(), b.y(), b.z()))))
+                        .button("Attack entity in crosshair", () -> onCrosshairEntity(entities, interactions, log,
+                                "Attack", interactions::hitEntity))
+                        .button("Use entity in crosshair", () -> onCrosshairEntity(entities, interactions, log,
+                                "Use", interactions::useOnEntity))
+                        .button("Use held item", () -> inAir(interactions, log, "Use held item", interactions::useItem))
+                        .button("Swing", () -> inAir(interactions, log, "Swing", interactions::swing))
                         .build())
                 .section("Scan radius", SettingsSpec.builder()
                         .int_("radius", "Radius", 1, 64, 4, v -> radius = v)
@@ -194,7 +221,7 @@ public class InteractionTestModule implements ProxyModule {
 
     /** Parses the X/Y/Z text fields and runs {@code action} on the resolved block. */
     private void runOnTarget(World world, InteractionControl interactions, Logger log,
-                             String label, Consumer<Block> action) {
+                             String label, Function<Block, CompletableFuture<InteractionOutcome>> action) {
         if (!interactions.available()) {
             log.warn("interaction-test: no session — join a world first");
             return;
@@ -205,7 +232,97 @@ public class InteractionTestModule implements ProxyModule {
         }
         BlockPos p = pos.get();
         log.info("interaction-test: '{}' at ({},{},{})", label, p.x(), p.y(), p.z());
-        action.accept(world.blockAt(p.x(), p.y(), p.z()));
+        report(log, label, action.apply(world.blockAt(p.x(), p.y(), p.z())));
+    }
+
+    // ------------------------------------------------------------------
+    // Forge: one click on what the crosshair is on, the server's verdict in the log
+    // ------------------------------------------------------------------
+
+    /** How far the crosshair reaches for a block or an entity - a little past the server's reach. */
+    private static final double CROSSHAIR_RANGE = 8.0;
+    /** How far off the look an entity may stand and still count as in the crosshair. */
+    private static final double CROSSHAIR_ANGLE_DEG = 12.0;
+
+    /** Acts on the block the crosshair is on. */
+    private void onCrosshairBlock(World world, Logger log, String label,
+                                  Function<Block, CompletableFuture<InteractionOutcome>> action) {
+        Optional<Player> player = world.player();
+        if (player.isEmpty()) {
+            log.warn("interaction-test: no player yet — join a world first");
+            return;
+        }
+        Optional<BlockPos> pos = player.get().lookedAtBlock(CROSSHAIR_RANGE);
+        if (pos.isEmpty()) {
+            log.warn("interaction-test: '{}' — no block in the crosshair within {}", label, CROSSHAIR_RANGE);
+            return;
+        }
+        BlockPos p = pos.get();
+        Block block = world.blockAt(p.x(), p.y(), p.z());
+        String what = String.format("%s on %s at (%d,%d,%d) with %s", label,
+                block.type() == null ? "air" : block.type().name(), p.x(), p.y(), p.z(), player.get().heldItem());
+        report(log, what, action.apply(block));
+    }
+
+    /** Acts on the entity the crosshair is on - or, with none there, the nearest one. */
+    private void onCrosshairEntity(EntityTracker entities, InteractionControl interactions, Logger log,
+                                   String label, Function<Integer, CompletableFuture<InteractionOutcome>> action) {
+        if (entities == null || !interactions.available()) {
+            log.warn("interaction-test: no session — join a world first");
+            return;
+        }
+        OptionalInt id = entities.entityInCrosshair(CROSSHAIR_ANGLE_DEG, CROSSHAIR_RANGE);
+        String how = "in the crosshair";
+        if (id.isEmpty()) {
+            id = entities.nearestEntity();
+            how = "nearest";
+        }
+        if (id.isEmpty()) {
+            log.warn("interaction-test: '{}' — no entity around", label);
+            return;
+        }
+        int target = id.getAsInt();
+        String what = String.format("%s on %s #%d (%s)", label,
+                entities.entityModelAssetId(target).or(() -> entities.entityTypeOf(target)).orElse("entity"),
+                target, how);
+        report(log, what, action.apply(target));
+    }
+
+    /** Acts with the held item at nothing in particular. */
+    private void inAir(InteractionControl interactions, Logger log, String label,
+                       Supplier<CompletableFuture<InteractionOutcome>> action) {
+        if (!interactions.available()) {
+            log.warn("interaction-test: no session — join a world first");
+            return;
+        }
+        report(log, label, action.get());
+    }
+
+    /**
+     * Logs how the server ran the chain once it says so: its status, the operations that failed
+     * (a chain often ends FINISHED down its failed branch), its forks, and how often the server
+     * corrected core's guess.
+     */
+    private static void report(Logger log, String what, CompletableFuture<InteractionOutcome> chain) {
+        chain.whenComplete((o, error) -> {
+            if (error != null) {
+                log.warn("interaction-test: {} — {}", what, error.toString());
+                return;
+            }
+            StringBuilder sb = new StringBuilder();
+            sb.append(o.status()).append(", ").append(o.steps().size()).append(" op(s)");
+            if (!o.failedSteps().isEmpty()) {
+                sb.append(", failed ").append(o.failedSteps().stream()
+                        .map(s -> s.index() + " " + s.operation()).toList());
+            }
+            if (!o.forks().isEmpty()) {
+                sb.append(", forks ").append(o.forks());
+            }
+            if (o.corrections() > 0) {
+                sb.append(", ").append(o.corrections()).append(" correction(s) by the server");
+            }
+            log.info("interaction-test: {} -> {}", what, sb);
+        });
     }
 
     private Optional<BlockPos> parseXyz(Logger log) {
