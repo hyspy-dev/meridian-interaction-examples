@@ -44,7 +44,7 @@ import org.slf4j.Logger;
  *       block reports as air (single hit isn't always enough).</li>
  *   <li><b>Forge</b> — one click acts on what the crosshair is on: the block (hit, use,
  *       right-click, place, dig swing), the entity (attack, use), or the air (use the held
- *       item, swing). Each logs how the server ran the chain ({@link InteractionOutcome}):
+ *       item, swing - held for the given time: a bow shoots past 100 ms). Each logs how the server ran the chain ({@link InteractionOutcome}):
  *       its status, the operations that failed, its forks, the corrections. The way to check
  *       core's forging by hand in a live game.</li>
  *   <li><b>Lights</b> — <i>Turn off lights nearby</i> scans a cube, filters by
@@ -83,6 +83,8 @@ public class InteractionTestModule implements ProxyModule {
     private volatile int lightRadius = 6;
     private volatile boolean autoLights = false;
     private volatile int dropQty = 0;
+    /** How long 'Use held item' and 'Swing' hold the button, in ms; 0 holds each charge to its first tier. */
+    private volatile int holdMs = 0;
 
     // Lamps already actuated: position -> the lit block id we forged a Use on. A
     // sweep skips a lamp still reading that same id (its Use hasn't propagated yet),
@@ -132,8 +134,12 @@ public class InteractionTestModule implements ProxyModule {
                                 "Attack", interactions::hitEntity))
                         .button("Use entity in crosshair", () -> onCrosshairEntity(entities, interactions, log,
                                 "Use", interactions::useOnEntity))
-                        .button("Use held item", () -> inAir(interactions, log, "Use held item", interactions::useItem))
-                        .button("Swing", () -> inAir(interactions, log, "Swing", interactions::swing))
+                        .int_("holdMs", "Hold for use / swing, ms (0: to the first charge tier)", 0, 5000, 0,
+                                v -> holdMs = v)
+                        .button("Use held item", () -> inAir(interactions, log, held("Use held item"),
+                                () -> holdMs > 0 ? interactions.useItem(Duration.ofMillis(holdMs)) : interactions.useItem()))
+                        .button("Swing", () -> inAir(interactions, log, held("Swing"),
+                                () -> holdMs > 0 ? interactions.swing(Duration.ofMillis(holdMs)) : interactions.swing()))
                         .build())
                 .section("Scan radius", SettingsSpec.builder()
                         .int_("radius", "Radius", 1, 64, 4, v -> radius = v)
@@ -159,7 +165,7 @@ public class InteractionTestModule implements ProxyModule {
                                 -1, 64, 0, v -> dropQty = v)
                         .button("Drop held", () -> dropHeld(world, log))
                         .build())
-                .persistent("radius", "match", "lightRadius", "dropQty")
+                .persistent("radius", "match", "lightRadius", "dropQty", "holdMs")
                 .build());
 
         // Cross-module fill — any module (currently ESP's "Nearest blocks"
@@ -286,6 +292,11 @@ public class InteractionTestModule implements ProxyModule {
                 entities.entityModelAssetId(target).or(() -> entities.entityTypeOf(target)).orElse("entity"),
                 target, how);
         report(log, what, action.apply(target));
+    }
+
+    /** An action's name with its hold, when there is one. */
+    private String held(String label) {
+        return holdMs > 0 ? label + " (held " + holdMs + " ms)" : label;
     }
 
     /** Acts with the held item at nothing in particular. */
