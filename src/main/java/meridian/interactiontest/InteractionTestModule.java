@@ -9,6 +9,7 @@ import java.util.OptionalInt;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Function;
+import java.util.function.Predicate;
 import java.util.function.Supplier;
 import javax.swing.SwingUtilities;
 import meridian.api.module.ModuleContext;
@@ -17,6 +18,7 @@ import meridian.api.settings.SettingBinding;
 import meridian.api.settings.SettingsSpec;
 import meridian.core.api.Block;
 import meridian.core.api.BlockPos;
+import meridian.core.api.BlockView;
 import meridian.core.api.EntityTracker;
 import meridian.core.api.InteractionControl;
 import meridian.core.api.InteractionOutcome;
@@ -68,8 +70,11 @@ import org.slf4j.Logger;
  */
 public class InteractionTestModule implements ProxyModule {
 
-    /** Cap on re-hits per block in 'Break nearby' — stops an unbreakable block looping. */
+    /** Cap on swings per block in 'Break nearby' — stops an unbreakable block looping. */
     private static final int MAX_HITS_PER_BLOCK = 12;
+
+    /** How long a lamp's Use is watched for the server's change before the sweeps take over. */
+    private static final Duration LIGHT_CHANGE_WAIT = Duration.ofSeconds(5);
 
     /** Auto-lights sweep cadence — the 0.25&nbsp;s tick requested for the area light-off. */
     private static final Duration AUTO_LIGHTS_PERIOD = Duration.ofMillis(250);
@@ -146,7 +151,7 @@ public class InteractionTestModule implements ProxyModule {
                         .string("match", "Name (contains)", "Flower",
                                 v -> matchText = v == null ? "" : v)
                         .button("Use nearby", () -> useNearby(world, log))
-                        .button("Break nearby", () -> breakNearby(world, log))
+                        .button("Break nearby", () -> breakNearby(world, interactions, log))
                         .button("Water nearby", () -> waterNearby(world, log))
                         .button("Plant nearby", () -> plantNearby(world, log))
                         .build())
@@ -288,9 +293,7 @@ public class InteractionTestModule implements ProxyModule {
             return;
         }
         int target = id.getAsInt();
-        String what = String.format("%s on %s #%d (%s)", label,
-                entities.entityModelAssetId(target).or(() -> entities.entityTypeOf(target)).orElse("entity"),
-                target, how);
+        String what = String.format("%s on %s #%d (%s)", label, entities.labelOf(target), target, how);
         report(log, what, action.apply(target));
     }
 
@@ -381,16 +384,9 @@ public class InteractionTestModule implements ProxyModule {
 
         // Tilled soil with air directly above — room for the crop block.
         List<Block> soil = new ArrayList<>();
-        for (int dx = -r; dx <= r; dx++) {
-            for (int dz = -r; dz <= r; dz++) {
-                for (int dy = -2; dy <= 1; dy++) {
-                    Block b = world.blockAt(px + dx, py + dy, pz + dz);
-                    if (b.type() != null && b.type().name() != null
-                            && b.type().name().contains("Tilled")
-                            && world.blockAt(b.x(), b.y() + 1, b.z()).isAir()) {
-                        soil.add(b);
-                    }
-                }
+        for (Block b : inBox(world, px, py, pz, r, -2, 1, InteractionTestModule::tilled)) {
+            if (world.blockAt(b.x(), b.y() + 1, b.z()).isAir()) {
+                soil.add(b);
             }
         }
         if (soil.isEmpty()) {
@@ -437,18 +433,7 @@ public class InteractionTestModule implements ProxyModule {
         int py = (int) Math.floor(pos.y());
         int pz = (int) Math.floor(pos.z());
 
-        List<Block> soil = new ArrayList<>();
-        for (int dx = -r; dx <= r; dx++) {
-            for (int dz = -r; dz <= r; dz++) {
-                for (int dy = -2; dy <= 1; dy++) {
-                    Block b = world.blockAt(px + dx, py + dy, pz + dz);
-                    if (b.type() != null && b.type().name() != null
-                            && b.type().name().contains("Tilled")) {
-                        soil.add(b);
-                    }
-                }
-            }
-        }
+        List<Block> soil = inBox(world, px, py, pz, r, -2, 1, InteractionTestModule::tilled);
         if (soil.isEmpty()) {
             log.info("interaction-test: 'Water nearby' — no tilled soil within {}", r);
             return;
@@ -488,17 +473,9 @@ public class InteractionTestModule implements ProxyModule {
         int pz = (int) Math.floor(pos.z());
 
         int used = 0;
-        for (int dx = -r; dx <= r; dx++) {
-            for (int dz = -r; dz <= r; dz++) {
-                for (int dy = -2; dy <= 2; dy++) {
-                    Block block = world.blockAt(px + dx, py + dy, pz + dz);
-                    if (block.type() != null && block.type().name() != null
-                            && block.type().name().contains(name)) {
-                        block.use();
-                        used++;
-                    }
-                }
-            }
+        for (Block block : inBox(world, px, py, pz, r, -2, 2, t -> named(t, name))) {
+            block.use();
+            used++;
         }
         log.info("interaction-test: 'Use nearby' radius {} name '{}' — used {} block(s)",
                 r, name, used);
@@ -544,10 +521,11 @@ public class InteractionTestModule implements ProxyModule {
      * before the resulting block change reaches the chunk tracker — so a naive sweep
      * sees the lamp still lit and fires again, flipping it back on (flicker). The
      * {@link #litActuated} guard keys on the <em>observed</em> block id: once a lit
-     * lamp is actuated, every later sweep that still reads that same id skips it, and
-     * only when the block reads unlit (its id changed) is the claim cleared. A lamp is
-     * therefore turned off exactly once and never toggled back on; a genuine re-light
-     * (the block goes unlit then lit again) is picked up afresh.
+     * lamp is actuated, every later sweep that still reads that same id skips it. The
+     * claim is let go when the server's change lands ({@link World#awaitBlock}), or when
+     * a sweep reads the lamp unlit or unloaded. A lamp is therefore turned off exactly
+     * once and never toggled back on; a genuine re-light (the block goes unlit then lit
+     * again) is picked up afresh. A lamp over two cells is one block, used once.
      *
      * <p>A lit block with no Use interaction (glowstone, lava) just no-ops the forge —
      * still actuated once, then left alone. Returns how many uses were issued;
@@ -570,30 +548,28 @@ public class InteractionTestModule implements ProxyModule {
         int py = (int) Math.floor(pos.y());
         int pz = (int) Math.floor(pos.z());
 
+        // Off / air / unloaded in the box — release the claim.
+        litActuated.keySet().removeIf(at -> Math.abs(at.x() - px) <= r && Math.abs(at.y() - py) <= r
+                && Math.abs(at.z() - pz) <= r && !litWith(world.blockAt(at.x(), at.y(), at.z()), -1));
         int used = 0;
-        for (int dx = -r; dx <= r; dx++) {
-            for (int dy = -r; dy <= r; dy++) {
-                for (int dz = -r; dz <= r; dz++) {
-                    Block block = world.blockAt(px + dx, py + dy, pz + dz);
-                    BlockPos at = new BlockPos(px + dx, py + dy, pz + dz);
-                    if (block.type() == null || !block.type().isLit()) {
-                        litActuated.remove(at); // off / air / unloaded — release the claim
-                        continue;
-                    }
-                    int id = block.type().id();
-                    Integer prev = litActuated.get(at);
-                    if (prev != null && prev == id) {
-                        continue; // already used this exact lit block; its change hasn't landed yet
-                    }
-                    litActuated.put(at, id);
-                    if (verbose) {
-                        log.info("interaction-test: light at ({},{},{}) '{}' state '{}'",
-                                at.x(), at.y(), at.z(), block.type().name(), block.type().state());
-                    }
-                    block.use();
-                    used++;
-                }
+        for (Block block : inBox(world, px, py, pz, r, -r, r, BlockView::isLit)) {
+            BlockPos at = new BlockPos(block.x(), block.y(), block.z());
+            int id = block.type().id();
+            Integer prev = litActuated.get(at);
+            if (prev != null && prev == id) {
+                continue; // already used this exact lit block; its change hasn't landed yet
             }
+            litActuated.put(at, id);
+            if (verbose) {
+                log.info("interaction-test: light at ({},{},{}) '{}' state '{}'",
+                        at.x(), at.y(), at.z(), block.type().name(), block.type().state());
+            }
+            block.use();
+            // The server's change lets the claim go; one that never comes (glowstone has no Use)
+            // leaves it to the sweeps.
+            world.awaitBlock(at, b -> !litWith(b, id), LIGHT_CHANGE_WAIT)
+                    .thenAccept(changed -> changed.ifPresent(b -> litActuated.remove(at, id)));
+            used++;
         }
         return used;
     }
@@ -608,10 +584,11 @@ public class InteractionTestModule implements ProxyModule {
     /**
      * Module-side logic: scan a cube around the player and break every non-air
      * block in range. The Name field filters by block-type name (empty matches
-     * all). One hit may not break a block, so each target is re-hit until the
-     * world shows it as air ({@link #hitUntilGone}).
+     * all). One hit may not break a block, so core swings at each target until the
+     * world shows it gone ({@link InteractionControl#breakBlock}), at most
+     * {@link #MAX_HITS_PER_BLOCK} times.
      */
-    private void breakNearby(World world, Logger log) {
+    private void breakNearby(World world, InteractionControl interactions, Logger log) {
         Optional<Player> maybePlayer = world.player();
         if (maybePlayer.isEmpty()) {
             log.warn("interaction-test: no session — join a world first");
@@ -629,42 +606,53 @@ public class InteractionTestModule implements ProxyModule {
         int pz = (int) Math.floor(pos.z());
 
         List<BlockPos> targets = new ArrayList<>();
-        for (int dx = -r; dx <= r; dx++) {
-            for (int dz = -r; dz <= r; dz++) {
-                for (int dy = -r; dy <= r; dy++) {
-                    Block block = world.blockAt(px + dx, py + dy, pz + dz);
-                    if (block.isAir() || block.type() == null || block.type().name() == null) {
-                        continue;
-                    }
-                    if (name.isEmpty() || block.type().name().contains(name)) {
-                        targets.add(new BlockPos(px + dx, py + dy, pz + dz));
-                    }
-                }
-            }
+        for (Block block : inBox(world, px, py, pz, r, -r, r, t -> name.isEmpty() ? t.name() != null : named(t, name))) {
+            targets.add(new BlockPos(block.x(), block.y(), block.z()));
         }
         log.info("interaction-test: 'Break nearby' radius {} name '{}' — {} target(s), "
                 + "hitting until clear", r, name, targets.size());
         for (BlockPos target : targets) {
-            hitUntilGone(world, log, target, 0);
+            interactions.breakBlock(target, MAX_HITS_PER_BLOCK).thenAccept(broken -> {
+                if (!broken) {
+                    log.warn("interaction-test: ({},{},{}) still not broken after {} hits — giving up",
+                            target.x(), target.y(), target.z(), MAX_HITS_PER_BLOCK);
+                }
+            });
         }
     }
 
     /**
-     * Reliability: a single hit may not break a block (a weak tool / hard block
-     * needs several). Re-hits {@code pos} until the world reports it as air,
-     * capped by {@link #MAX_HITS_PER_BLOCK} so an unbreakable block can't loop
-     * forever. Each follow-up hit is chained off the previous forge's future.
+     * The blocks of a box about the player's cell - x and z within {@code r} of it, y from
+     * {@code lo} to {@code hi} over it - whose type {@code type} accepts: core's search over the
+     * sphere round the box, the box cut out of it. A block over more than one cell (a door, a bed)
+     * is found once, at the cell it stands on; air and cells core has not been sent never are.
      */
-    private static void hitUntilGone(World world, Logger log, BlockPos pos, int attempt) {
-        Block block = world.blockAt(pos.x(), pos.y(), pos.z());
-        if (block.isAir()) {
-            return; // broken
+    private static List<Block> inBox(World world, int px, int py, int pz, int r, int lo, int hi,
+                                     Predicate<BlockView> type) {
+        double half = (hi - lo) / 2.0;
+        double reach = Math.sqrt(2.0 * r * r + half * half) + 1e-6;
+        Vec3 middle = new Vec3(px + 0.5, py + 0.5 + (lo + hi) / 2.0, pz + 0.5);
+        List<Block> out = new ArrayList<>();
+        for (Block b : world.find(middle, reach, type, Integer.MAX_VALUE)) {
+            int dy = b.y() - py;
+            if (Math.abs(b.x() - px) <= r && Math.abs(b.z() - pz) <= r && dy >= lo && dy <= hi) {
+                out.add(b);
+            }
         }
-        if (attempt >= MAX_HITS_PER_BLOCK) {
-            log.warn("interaction-test: ({},{},{}) still not broken after {} hits — giving up",
-                    pos.x(), pos.y(), pos.z(), MAX_HITS_PER_BLOCK);
-            return;
-        }
-        block.hit().thenRun(() -> hitUntilGone(world, log, pos, attempt + 1));
+        return out;
+    }
+
+    /** A block type whose name contains {@code part} (case counts). */
+    private static boolean named(BlockView t, String part) {
+        return t.name() != null && t.name().contains(part);
+    }
+
+    private static boolean tilled(BlockView t) {
+        return named(t, "Tilled");
+    }
+
+    /** Whether a block is lit - and, for {@code id} 0 or more, still that very block. */
+    private static boolean litWith(Block b, int id) {
+        return b.type() != null && b.type().isLit() && (id < 0 || b.type().id() == id);
     }
 }
